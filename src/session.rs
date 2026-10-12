@@ -62,7 +62,9 @@ pub async fn receiver(
     mut stop: oneshot::Receiver<()>,
     backend: std::sync::Arc<crate::Backend>,
 ) -> Result<(), String> {
-    let mut injector = inputs::inject::Injector::new().map_err(|e| e.to_string())?;
+    stream.set_nodelay(true).map_err(|e| e.to_string())?;
+    let mut injector = inputs::inject::Injector::new()
+        .map_err(|e| format!("Создание устройства ввода Mac: {e}"))?;
     let mut bounds = desktop::screens()?
         .into_iter()
         .find(|s| s.primary)
@@ -74,11 +76,12 @@ pub async fn receiver(
     let mut state = InputState::default();
     let mut pointer: Option<RemotePointer> = None;
     let mut sequence = 0;
+    let mut logged_first_motion = false;
     let mut last = 0;
     let mut heartbeat = tokio::time::interval(Duration::from_millis(500));
     let mut screen_refresh = tokio::time::interval(Duration::from_secs(2));
     let mut last_layout = Vec::new();
-    backend.state.write().await.engine_state = "Подключено · курсор на Windows".into();
+    crate::engine_state(&backend, "Подключено · курсор на Windows").await;
     let result=async{
         loop {
             tokio::select!{
@@ -109,20 +112,23 @@ pub async fn receiver(
                                 InputEvent::Enter{position} if valid_position(position)=>{
                                     release(&mut state,&mut injector);
                                     let p=RemotePointer::enter(bounds,position);
+                                    logged_first_motion = false;
                                     desktop::move_pointer(p.x,p.y,None)?;
                                     pointer=Some(p);
-                                    backend.state.write().await.engine_state="Управление на Mac · вверх для возврата".into();
+                                    crate::engine_state(&backend, "Управление на Mac · вверх для возврата").await;
                                 },
                                 InputEvent::ReleaseAll=>{
                                     release(&mut state,&mut injector); pointer=None;
-                                    backend.state.write().await.engine_state="Подключено · курсор на Windows".into();
+                                    crate::engine_state(&backend, "Подключено · курсор на Windows").await;
                                 },
                                 InputEvent::Pointer{dx,dy} if dx.is_finite() && dy.is_finite() && dx.abs()<=100000. && dy.abs()<=100000.=>{
                                     if let Some(p)=pointer.as_mut(){
+                                        if !logged_first_motion { crate::diagnostics::record("first_pointer", "Received Windows pointer movement"); logged_first_motion = true; }
                                         if let Some(position)=p.motion(dx,dy){
+                                            crate::diagnostics::record("return_control", "Mac top edge crossed");
                                             release(&mut state,&mut injector); pointer=None;
                                             send(&mut write,&mut cipher,Frame::ReturnControl{position}).await?;
-                                            backend.state.write().await.engine_state="Подключено · курсор на Windows".into();
+                                            crate::engine_state(&backend, "Подключено · курсор на Windows").await;
                                         } else {desktop::move_pointer(p.x,p.y,state.drag_button())?;}
                                     }
                                 },
@@ -132,6 +138,8 @@ pub async fn receiver(
                                             && (!horizontal.is_finite() || !vertical.is_finite()) {
                                             return Err("Некорректная прокрутка".into());
                                         }
+                                        // Toggle keys must not toggle repeatedly on Windows auto-repeat.
+                                        if state.repeated_lock_press(&event) { continue; }
                                         // Track before injection so cleanup includes an OS call that failed.
                                         state.track(&event);
                                         if let InputEvent::Button{button,pressed}=event {
@@ -143,10 +151,11 @@ pub async fn receiver(
                             }
                         },
                         Frame::ScreenLayout{displays} if desktop::validate_screens(&displays)=>{
+                            crate::diagnostics::record("peer_layout", &serde_json::to_string(&displays).unwrap_or_default());
                             backend.state.write().await.peer_layout=displays;
                         },
                         Frame::KeepAlive{..}=>{},
-                        Frame::Disconnect{..}=>break,
+                        Frame::Disconnect{reason}=>return Err(format!("Другой компьютер отключился: {reason}")),
                         _=>return Err("Некорректный пакет с Windows".into()),
                     }
                 }
@@ -165,6 +174,7 @@ pub async fn source(
     shared: [u8; 32],
     backend: std::sync::Arc<crate::Backend>,
 ) -> Result<(), String> {
+    stream.set_nodelay(true).map_err(|e| e.to_string())?;
     let mut captured = backend
         .capture
         .lock()
@@ -176,11 +186,12 @@ pub async fn source(
     while captured.try_recv().is_ok() {}
     let percent = backend.state.read().await.handoff_percent;
     platform_input::configure_session(percent);
-    backend.state.write().await.engine_state = "Подключено · курсор на Windows".into();
+    crate::engine_state(&backend, "Подключено · курсор на Windows").await;
     let (read, mut write) = stream.into_split();
     let (mut incoming, reader) = reader(read, SessionCipher::new(shared, false)?);
     let mut cipher = SessionCipher::new(shared, false)?;
     let mut sequence = 0;
+    let mut logged_first_motion = false;
     let mut heartbeat = tokio::time::interval(Duration::from_millis(500));
     let mut screen_refresh = tokio::time::interval(Duration::from_secs(2));
     let mut last_layout = Vec::new();
@@ -201,10 +212,11 @@ pub async fn source(
                 frame=incoming.recv()=>match frame.ok_or("Канал закрыт")?? {
                     Frame::ReturnControl{position} if valid_position(position)=>platform_input::return_local(position),
                     Frame::ScreenLayout{displays} if desktop::validate_screens(&displays)=>{
+                        crate::diagnostics::record("peer_layout", &serde_json::to_string(&displays).unwrap_or_default());
                         backend.state.write().await.peer_layout=displays;
                     },
                     Frame::KeepAlive{..}=>{},
-                    Frame::Disconnect{..}=>break,
+                    Frame::Disconnect{reason}=>return Err(format!("Другой компьютер отключился: {reason}")),
                     _=>return Err("Некорректный пакет с Mac".into()),
                 },
                 event=captured.recv()=>{
@@ -212,13 +224,13 @@ pub async fn source(
                         Captured::Input(event)=>event,
                         Captured::Local=>InputEvent::ReleaseAll,
                     };
-                    if matches!(event,InputEvent::Enter{..}){backend.state.write().await.engine_state="Управление на Mac · Ctrl+Alt+F12 для возврата".into();}
-                    if matches!(event,InputEvent::ReleaseAll){backend.state.write().await.engine_state="Подключено · курсор на Windows".into();}
+                    if matches!(event,InputEvent::Enter{..}){logged_first_motion=false;crate::engine_state(&backend, "Управление на Mac · Ctrl+Alt+F12 для возврата").await;}
+                    if matches!(event,InputEvent::ReleaseAll){crate::engine_state(&backend, "Подключено · курсор на Windows").await;}
+                    if matches!(event, InputEvent::Pointer{..}) && !logged_first_motion { crate::diagnostics::record("first_pointer", "Sending pointer movement to Mac"); logged_first_motion=true; }
                     sequence+=1;send(&mut write,&mut cipher,Frame::Input{sequence,event}).await?;
                 }
             }
         }
-        Ok(())
     }.await;
     // Release local suppression before awaiting any network operation.
     platform_input::end_session();

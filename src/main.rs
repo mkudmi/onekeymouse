@@ -18,6 +18,7 @@ use std::{
     },
     time::Duration,
 };
+use tauri::Manager;
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
@@ -43,6 +44,12 @@ struct Backend {
     capture: std::sync::Mutex<Option<platform_input::InputCapture>>,
     pending_pair: std::sync::Mutex<Option<PendingPair>>,
     session_busy: Arc<AtomicBool>,
+}
+
+async fn engine_state(backend: &Backend, message: impl Into<String>) {
+    let message = message.into();
+    diagnostics::record("state", &message);
+    backend.state.write().await.engine_state = message;
 }
 
 struct SessionBusy(Arc<AtomicBool>);
@@ -93,6 +100,7 @@ struct Peer {
 }
 
 mod desktop;
+mod diagnostics;
 mod handoff;
 mod input;
 mod platform_input;
@@ -103,6 +111,9 @@ mod windows_motion;
 fn main() {
     tauri::Builder::default()
         .setup(|app| {
+            if let Err(error) = diagnostics::init(app.path().app_log_dir()?) {
+                eprintln!("Cannot initialize diagnostics: {error}");
+            }
             let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
             std::thread::Builder::new()
                 .name("onekeymouse-backend".into())
@@ -166,6 +177,10 @@ async fn run_backend(ready: std::sync::mpsc::SyncSender<u16>) {
     let app = Router::new()
         .route("/", get(index))
         .route("/api/status", get(status))
+        .route(
+            "/api/diagnostics",
+            get(|| async { Json(diagnostics::snapshot()) }),
+        )
         .route("/api/peers", get(peers))
         .route("/api/layout", get(layout))
         .route("/api/layout/handoff", post(set_handoff))
@@ -287,6 +302,7 @@ async fn start_engine(
         }
     }
     if !is_windows && let Err(message) = desktop::check_receive_permission(true) {
+        engine_state(&backend, message.clone()).await;
         return (
             StatusCode::FORBIDDEN,
             Json(serde_json::json!({"ok":false,"message":message})),
@@ -297,6 +313,7 @@ async fn start_engine(
         let capture = match platform_input::start_capture() {
             Ok(c) => c,
             Err(error) => {
+                engine_state(&backend, format!("Захват Windows: {error}")).await;
                 return (
                     StatusCode::SERVICE_UNAVAILABLE,
                     Json(serde_json::json!({"ok":false,"message":error})),
@@ -305,7 +322,7 @@ async fn start_engine(
             }
         };
         *backend.capture.lock().unwrap() = Some(capture);
-        backend.state.write().await.engine_state = "Ожидание подключения Mac".into();
+        engine_state(&backend, "Ожидание подключения Mac").await;
         return (StatusCode::OK,Json(serde_json::json!({"ok":true,"message":"Захват Windows включён. На Mac укажи IP Windows и нажми «Подключиться». После сопряжения веди курсор вниз через настроенный участок края. Ctrl+Alt+F12 возвращает управление Windows.","port":input::INPUT_PORT}))).into_response();
     }
     let host = request.peer_host.unwrap_or_default();
@@ -338,80 +355,75 @@ async fn start_engine(
         *worker_slot = None;
     }
     let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+    engine_state(&backend, format!("Подключение к {addr}")).await;
     let worker = tokio::spawn(async move {
-        let mut stream = match tokio::time::timeout(
-            Duration::from_secs(5),
-            tokio::net::TcpStream::connect(addr),
-        )
-        .await
-        {
-            Ok(Ok(s)) => s,
-            _ => {
-                worker_state.state.write().await.engine_state = "Не удалось подключиться".into();
-                return;
-            }
-        };
-        let local = input::EphemeralKey::generate();
-        let challenge = input::random_challenge();
-        if input::write_frame(
-            &mut stream,
-            &input::Frame::PairRequest {
-                version: input::PROTOCOL_VERSION,
-                device_id,
-                device_name,
-                platform,
-                public_key: local.public().to_vec(),
-                challenge: challenge.to_vec(),
-            },
-        )
-        .await
-        .is_err()
-        {
-            return;
-        }
-        let accepted =
-            match tokio::time::timeout(Duration::from_secs(65), input::read_frame(&mut stream))
-                .await
-            {
-                Ok(Ok(input::Frame::PairAccept {
+        let outcome: Result<(), String> = async {
+            diagnostics::record("connect", &addr.to_string());
+            let mut stream =
+                tokio::time::timeout(Duration::from_secs(5), tokio::net::TcpStream::connect(addr))
+                    .await
+                    .map_err(|_| "Таймаут подключения к Windows".to_string())?
+                    .map_err(|e| format!("Подключение к Windows: {e}"))?;
+            diagnostics::record("tcp_connected", &addr.to_string());
+            let local = input::EphemeralKey::generate();
+            let challenge = input::random_challenge();
+            input::write_frame(
+                &mut stream,
+                &input::Frame::PairRequest {
+                    version: input::PROTOCOL_VERSION,
+                    device_id,
+                    device_name,
+                    platform,
+                    public_key: local.public().to_vec(),
+                    challenge: challenge.to_vec(),
+                },
+            )
+            .await
+            .map_err(|e| format!("Отправка запроса сопряжения: {e}"))?;
+            engine_state(&worker_state, "Ожидание подтверждения на Windows").await;
+            let accepted =
+                tokio::time::timeout(Duration::from_secs(65), input::read_frame(&mut stream))
+                    .await
+                    .map_err(|_| "Истекло время подтверждения на Windows".to_string())?
+                    .map_err(|e| format!("Ответ сопряжения: {e}"))?;
+            let (public_key, proof) = match accepted {
+                input::Frame::PairAccept {
                     version,
                     public_key,
                     proof,
                     ..
-                })) if version == input::PROTOCOL_VERSION && public_key.len() == 32 => {
+                } if version == input::PROTOCOL_VERSION && public_key.len() == 32 => {
                     (public_key, proof)
                 }
-                _ => {
-                    worker_state.state.write().await.engine_state =
-                        "Сопряжение отклонено или истекло время ожидания".into();
-                    return;
-                }
+                input::Frame::Disconnect { reason } => return Err(format!("Windows: {reason}")),
+                _ => return Err("Несовместимый ответ сопряжения; обнови оба приложения".into()),
             };
-        let shared = match local.agree(accepted.0.try_into().unwrap()) {
-            Ok(s) => s,
-            Err(_) => return,
-        };
-        if accepted.1.as_slice() != input::session_proof(&shared, &challenge).as_slice() {
-            return;
+            let shared = local.agree(public_key.try_into().unwrap())?;
+            if proof.as_slice() != input::session_proof(&shared, &challenge).as_slice() {
+                return Err("Не прошла проверка Windows".into());
+            }
+            let mut confirm_context = challenge.to_vec();
+            confirm_context.extend_from_slice(b"confirm");
+            input::write_frame(
+                &mut stream,
+                &input::Frame::PairConfirm {
+                    proof: input::session_proof(&shared, &confirm_context).to_vec(),
+                },
+            )
+            .await
+            .map_err(|e| format!("Подтверждение сопряжения: {e}"))?;
+            diagnostics::record("paired", "Windows confirmed; starting receiver");
+            session::receiver(stream, shared, stop_rx, worker_state.clone()).await
         }
-        let mut confirm_context = challenge.to_vec();
-        confirm_context.extend_from_slice(b"confirm");
-        if input::write_frame(
-            &mut stream,
-            &input::Frame::PairConfirm {
-                proof: input::session_proof(&shared, &confirm_context).to_vec(),
+        .await;
+        engine_state(
+            &worker_state,
+            match outcome {
+                Ok(()) => "Остановлен пользователем".into(),
+                Err(error) => format!("Остановлен: {error}"),
             },
         )
-        .await
-        .is_err()
-        {
-            return;
-        }
-        let outcome = session::receiver(stream, shared, stop_rx, worker_state.clone()).await;
-        worker_state.state.write().await.engine_state = match outcome {
-            Ok(()) => "Остановлен".into(),
-            Err(error) => format!("Остановлен: {error}"),
-        };
+        .await;
     });
     *backend.worker.lock().await = Some(EngineWorker {
         task: worker,
@@ -421,11 +433,17 @@ async fn start_engine(
 }
 
 async fn input_server(backend: Arc<Backend>, snapshot: AppState) {
-    let Ok(listener) =
-        tokio::net::TcpListener::bind(SocketAddr::from(([0, 0, 0, 0], input::INPUT_PORT))).await
-    else {
-        return;
-    };
+    let listener =
+        match tokio::net::TcpListener::bind(SocketAddr::from(([0, 0, 0, 0], input::INPUT_PORT)))
+            .await
+        {
+            Ok(listener) => listener,
+            Err(error) => {
+                diagnostics::record("listen_failed", &error.to_string());
+                return;
+            }
+        };
+    diagnostics::record("listening", &input::INPUT_PORT.to_string());
     loop {
         let Ok((mut stream, addr)) = listener.accept().await else {
             continue;
@@ -441,6 +459,7 @@ async fn input_server(backend: Arc<Backend>, snapshot: AppState) {
         let snapshot = snapshot.clone();
         tokio::spawn(async move {
             use input::Frame;
+            diagnostics::record("incoming_connection", &addr.to_string());
             let request =
                 match tokio::time::timeout(Duration::from_secs(10), input::read_frame(&mut stream))
                     .await
@@ -458,13 +477,22 @@ async fn input_server(backend: Arc<Backend>, snapshot: AppState) {
                     {
                         (device_id, device_name, platform, public_key, challenge)
                     }
-                    _ => return,
+                    _ => {
+                        diagnostics::record("pair_failed", "Invalid or timed out pairing frame");
+                        return;
+                    }
                 };
             if backend.capture.lock().unwrap().is_none() {
                 let _ = input::write_frame(
                     &mut stream,
                     &Frame::Disconnect {
-                        reason: "Windows input capture is not running".into(),
+                        reason: {
+                            diagnostics::record(
+                                "pair_rejected",
+                                "Windows input capture is not running",
+                            );
+                            "Windows input capture is not running".into()
+                        },
                     },
                 )
                 .await;
@@ -478,7 +506,13 @@ async fn input_server(backend: Arc<Backend>, snapshot: AppState) {
                 let _ = input::write_frame(
                     &mut stream,
                     &Frame::Disconnect {
-                        reason: "Windows is already pairing or connected".into(),
+                        reason: {
+                            diagnostics::record(
+                                "pair_rejected",
+                                "Windows is already pairing or connected",
+                            );
+                            "Windows is already pairing or connected".into()
+                        },
                     },
                 )
                 .await;
@@ -491,7 +525,10 @@ async fn input_server(backend: Arc<Backend>, snapshot: AppState) {
             let ephemeral = input::EphemeralKey::generate();
             let shared = match ephemeral.agree(pubkey) {
                 Ok(k) => k,
-                Err(_) => return,
+                Err(error) => {
+                    diagnostics::record("pair_failed", &error.to_string());
+                    return;
+                }
             };
             let (tx, rx) = tokio::sync::oneshot::channel();
             let already_pending = {
@@ -513,12 +550,16 @@ async fn input_server(backend: Arc<Backend>, snapshot: AppState) {
                 let _ = input::write_frame(
                     &mut stream,
                     &Frame::Disconnect {
-                        reason: "pairing request already pending".into(),
+                        reason: {
+                            diagnostics::record("pair_rejected", "pairing request already pending");
+                            "pairing request already pending".into()
+                        },
                     },
                 )
                 .await;
                 return;
             }
+            diagnostics::record("pair_pending", "Waiting for Windows approval");
             let approved = matches!(
                 tokio::time::timeout(Duration::from_secs(60), rx).await,
                 Ok(Ok(true))
@@ -533,7 +574,10 @@ async fn input_server(backend: Arc<Backend>, snapshot: AppState) {
                 let _ = input::write_frame(
                     &mut stream,
                     &Frame::Disconnect {
-                        reason: "pairing declined or timed out".into(),
+                        reason: {
+                            diagnostics::record("pair_rejected", "pairing declined or timed out");
+                            "pairing declined or timed out".into()
+                        },
                     },
                 )
                 .await;
@@ -543,7 +587,13 @@ async fn input_server(backend: Arc<Backend>, snapshot: AppState) {
                 let _ = input::write_frame(
                     &mut stream,
                     &Frame::Disconnect {
-                        reason: "Windows input capture was stopped".into(),
+                        reason: {
+                            diagnostics::record(
+                                "pair_rejected",
+                                "Windows input capture was stopped",
+                            );
+                            "Windows input capture was stopped".into()
+                        },
                     },
                 )
                 .await;
@@ -568,6 +618,7 @@ async fn input_server(backend: Arc<Backend>, snapshot: AppState) {
             .await
             .is_err()
             {
+                diagnostics::record("pair_failed", "Cannot send pairing acceptance");
                 return;
             }
             let confirm =
@@ -575,18 +626,27 @@ async fn input_server(backend: Arc<Backend>, snapshot: AppState) {
                     .await
                 {
                     Ok(Ok(Frame::PairConfirm { proof })) => proof,
-                    _ => return,
+                    _ => {
+                        diagnostics::record("pair_failed", "Invalid or timed out pairing frame");
+                        return;
+                    }
                 };
             let mut confirm_context = challenge.clone();
             confirm_context.extend_from_slice(b"confirm");
             if confirm.as_slice() != input::session_proof(&shared, &confirm_context).as_slice() {
+                diagnostics::record("pair_failed", "Invalid Mac confirmation proof");
                 return;
             }
+            diagnostics::record("paired", "Mac confirmed; starting capture transport");
             let outcome = session::source(stream, shared, backend.clone()).await;
-            backend.state.write().await.engine_state = match outcome {
-                Ok(()) => "Ожидание подключения Mac".into(),
-                Err(error) => format!("Остановлен: {error}"),
-            };
+            engine_state(
+                &backend,
+                match outcome {
+                    Ok(()) => "Ожидание подключения Mac".into(),
+                    Err(error) => format!("Остановлен: {error}"),
+                },
+            )
+            .await;
         });
     }
 }
@@ -612,7 +672,7 @@ async fn stop_engine(State(backend): State<Arc<Backend>>) -> impl IntoResponse {
     }
     backend.capture.lock().unwrap().take();
     *backend.pending_pair.lock().unwrap() = None;
-    backend.state.write().await.engine_state = "Остановлен".into();
+    engine_state(&backend, "Остановлен пользователем").await;
     Json(
         serde_json::json!({"ok":true,"message":"OneKeyMouse остановлен, локальные клавиши освобождены."}),
     )

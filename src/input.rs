@@ -95,6 +95,17 @@ impl InputState {
         .into_iter()
         .find(|b| self.buttons.contains(b))
     }
+    pub fn repeated_lock_press(&self, event: &InputEvent) -> bool {
+        matches!(
+            event,
+            InputEvent::Key {
+                code: inputs::PhysicalKey::Code(inputs::KeyCode::CapsLock),
+                pressed: true
+            }
+        ) && self
+            .keys
+            .contains(&inputs::PhysicalKey::Code(inputs::KeyCode::CapsLock))
+    }
     pub fn track(&mut self, e: &InputEvent) {
         match e {
             InputEvent::Key { code, pressed } => {
@@ -143,8 +154,10 @@ pub async fn write_frame(s: &mut TcpStream, f: &Frame) -> std::io::Result<()> {
             "frame too large",
         ));
     }
-    s.write_u32(b.len() as u32).await?;
-    s.write_all(&b).await
+    let mut packet = Vec::with_capacity(4 + b.len());
+    packet.extend_from_slice(&(b.len() as u32).to_be_bytes());
+    packet.extend_from_slice(&b);
+    s.write_all(&packet).await
 }
 pub async fn read_frame(s: &mut TcpStream) -> std::io::Result<Frame> {
     let n = s.read_u32().await? as usize;
@@ -302,8 +315,10 @@ pub async fn write_secure(
             "frame exceeds protocol limit",
         ));
     }
-    stream.write_u32(encrypted.len() as u32).await?;
-    stream.write_all(&encrypted).await
+    let mut packet = Vec::with_capacity(4 + encrypted.len());
+    packet.extend_from_slice(&(encrypted.len() as u32).to_be_bytes());
+    packet.extend_from_slice(&encrypted);
+    stream.write_all(&packet).await
 }
 pub async fn read_secure(
     stream: &mut (impl tokio::io::AsyncRead + Unpin),
@@ -325,6 +340,73 @@ pub async fn read_secure(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn caps_lock_repeat_does_not_toggle_again_but_next_press_can() {
+        let down = InputEvent::Key {
+            code: inputs::PhysicalKey::Code(inputs::KeyCode::CapsLock),
+            pressed: true,
+        };
+        let up = InputEvent::Key {
+            code: inputs::PhysicalKey::Code(inputs::KeyCode::CapsLock),
+            pressed: false,
+        };
+        let mut state = InputState::default();
+        assert!(!state.repeated_lock_press(&down));
+        state.track(&down);
+        assert!(state.repeated_lock_press(&down));
+        assert!(!state.repeated_lock_press(&up));
+        state.track(&up);
+        assert!(!state.repeated_lock_press(&down));
+        state.track(&down);
+        state.release_all();
+        assert!(!state.repeated_lock_press(&down));
+    }
+
+    #[tokio::test]
+    async fn secure_frame_prefix_and_body_are_one_write() {
+        #[derive(Default)]
+        struct Recorder {
+            bytes: Vec<u8>,
+            writes: usize,
+        }
+        impl tokio::io::AsyncWrite for Recorder {
+            fn poll_write(
+                mut self: std::pin::Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+                buf: &[u8],
+            ) -> std::task::Poll<std::io::Result<usize>> {
+                self.writes += 1;
+                self.bytes.extend_from_slice(buf);
+                std::task::Poll::Ready(Ok(buf.len()))
+            }
+            fn poll_flush(
+                self: std::pin::Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::task::Poll::Ready(Ok(()))
+            }
+            fn poll_shutdown(
+                self: std::pin::Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::task::Poll::Ready(Ok(()))
+            }
+        }
+        let mut output = Recorder::default();
+        let mut sender = SessionCipher::new([31; 32], false).unwrap();
+        write_secure(&mut output, &mut sender, &Frame::KeepAlive { sequence: 7 })
+            .await
+            .unwrap();
+        assert_eq!(output.writes, 1);
+        let length = u32::from_be_bytes(output.bytes[..4].try_into().unwrap()) as usize;
+        assert_eq!(length, output.bytes.len() - 4);
+        let mut receiver = SessionCipher::new([31; 32], true).unwrap();
+        let body = receiver.open(&output.bytes[4..]).unwrap();
+        assert!(matches!(
+            serde_json::from_slice::<Frame>(&body).unwrap(),
+            Frame::KeepAlive { sequence: 7 }
+        ));
+    }
     #[test]
     fn held_remote_inputs_release_once_on_return_or_disconnect() {
         let mut state = InputState::default();

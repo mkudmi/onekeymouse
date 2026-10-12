@@ -235,17 +235,19 @@ pub fn take_capture_overflow() -> bool {
 #[cfg(target_os = "windows")]
 pub fn source_motion(x: f64, y: f64, previous_x: f64, previous_y: f64) -> bool {
     let mut r = routing().lock().unwrap();
-    let dx = x - previous_x;
-    let dy = y - previous_y;
     if r.remote {
-        return enqueue(&mut r, Captured::Input(InputEvent::Pointer { dx, dy }));
-    }
-    if !r.connected || !r.held_keys.is_empty() || !r.held_buttons.is_empty() {
+        return true;
+    } // Raw Input supplies unclipped relative motion.
+    if !r.connected {
         return false;
     }
-    let Some(edge) = crate::handoff::exit_edge(&r.monitors, r.percent, x, y, dy) else {
+    let Some(edge) =
+        crate::handoff::crossed_exit_edge(&r.monitors, r.percent, x, y, previous_x, previous_y)
+    else {
         return false;
     };
+    // The OS state also covers keys held before capture and avoids a missed
+    // release in listener history blocking handoff indefinitely.
     if crate::desktop::physical_inputs_held() {
         return false;
     }
@@ -256,14 +258,10 @@ pub fn source_motion(x: f64, y: f64, previous_x: f64, previous_y: f64) -> bool {
     r.edge = Some(edge);
     r.entry = position;
     r.remote = true;
-    // Park away from the Windows desktop boundary so motion in every direction
-    // keeps producing coordinates even while the physical stream is suppressed.
-    let cx = edge.monitor.x + edge.monitor.width / 2.;
-    let cy = edge.monitor.y + edge.monitor.height / 2.;
-    // This is the mouse-hook thread; windows_motion::warp bypasses our own
-    // reentrant callback. Keep the route locked until parking completes so a
-    // simultaneous remote return cannot be overwritten by a late park.
-    if crate::desktop::warp(cx, cy).is_err() {
+    // Keep the visible Windows cursor at the crossing point. Raw Input is
+    // independent of that position, including when the cursor is at an edge.
+    let parked_x = edge.start + position * (edge.end - edge.start - 1.0).max(0.0);
+    if crate::desktop::warp(parked_x, edge.y - 1.0).is_err() {
         CAPTURE_OVERFLOW.store(true, Ordering::SeqCst);
         r.remote = false;
         r.connected = false;
@@ -271,6 +269,25 @@ pub fn source_motion(x: f64, y: f64, previous_x: f64, previous_y: f64) -> bool {
     }
     true
 }
+#[cfg(target_os = "windows")]
+pub fn raw_motion(dx: f64, dy: f64, x: f64, y: f64) {
+    if dx == 0.0 && dy == 0.0 {
+        return;
+    }
+    {
+        let mut r = routing().lock().unwrap();
+        if r.remote {
+            enqueue(&mut r, Captured::Input(InputEvent::Pointer { dx, dy }));
+            return;
+        }
+    }
+    // When Windows clamps the cursor at its edge, hook coordinates can have
+    // zero dy even though the hardware is still moving downward.
+    if dy > 0.0 {
+        source_motion(x, y, x, y - dy);
+    }
+}
+
 pub fn to_wire(event: &Event) -> Option<crate::input::InputEvent> {
     use crate::input::{InputEvent as Wire, MouseButton as B};
     match &event.kind {

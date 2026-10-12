@@ -83,6 +83,44 @@ pub fn exit_edge(monitors: &[Rect], percent: f32, x: f64, y: f64, dy: f64) -> Op
     }
     None
 }
+/// A fast proposed move can overshoot the final screen row entirely.
+/// Restrict the search to the screen containing the previous position, then
+/// evaluate its boundary rather than requiring the proposed point to land on it.
+#[cfg_attr(not(any(target_os = "windows", test)), allow(dead_code))]
+pub fn crossed_exit_edge(
+    monitors: &[Rect],
+    percent: f32,
+    x: f64,
+    y: f64,
+    previous_x: f64,
+    previous_y: f64,
+) -> Option<Edge> {
+    let dy = y - previous_y;
+    if dy <= 0.0 {
+        return None;
+    }
+    for monitor in monitors {
+        if previous_x >= monitor.x
+            && previous_x < monitor.right()
+            && previous_y >= monitor.y
+            && previous_y < monitor.bottom()
+            && y >= monitor.bottom() - 2.0
+        {
+            let crossing_x = if y >= monitor.bottom() {
+                let t = ((monitor.bottom() - 1.0 - previous_y) / dy).clamp(0.0, 1.0);
+                previous_x + (x - previous_x) * t
+            } else {
+                x
+            };
+            if let Some(edge) = exit_edge(monitors, percent, crossing_x, monitor.bottom() - 1.0, dy)
+            {
+                return Some(edge);
+            }
+        }
+    }
+    None
+}
+
 #[derive(Debug)]
 pub struct RemotePointer {
     pub bounds: Rect,
@@ -151,6 +189,27 @@ mod tests {
         assert!(exit_edge(&[top, below], 0., -400., -1., 10.).is_none());
         let e = exit_edge(&[top, below], 0., -1200., -1., 10.).unwrap();
         assert_eq!(e.end, -800.);
+    }
+    #[test]
+    fn fast_motion_crosses_bottom_without_landing_on_last_row() {
+        let screens = [LAPTOP, UPPER];
+        assert!(crossed_exit_edge(&screens, 42.9, 3000., 1500., 3000., 1300.).is_some());
+        assert!(crossed_exit_edge(&screens, 42.9, 3000., 1439., 3000., 1400.).is_some());
+        assert!(crossed_exit_edge(&screens, 42.9, 1000., 1500., 1000., 1300.).is_none());
+        assert!(crossed_exit_edge(&screens, 42.9, 3000., 1300., 3000., 1500.).is_none());
+        let top = Rect {
+            x: 0.,
+            y: 0.,
+            width: 1000.,
+            height: 1000.,
+        };
+        let below = Rect {
+            x: 0.,
+            y: 1000.,
+            width: 1000.,
+            height: 1000.,
+        };
+        assert!(crossed_exit_edge(&[top, below], 0., 500., 1100., 500., 900.).is_none());
     }
     #[test]
     fn mac_maps_entry_clamps_and_returns_at_top() {

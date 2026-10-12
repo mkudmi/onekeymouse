@@ -37,3 +37,9 @@ Windows builds scan the finished installer and its extracted payload with Micros
 The installer displays Microsoft's WebView2 setup if the runtime is missing; it does not install that dependency silently. Current builds are unsigned. A passing Defender scan does not guarantee that Chrome Safe Browsing or SmartScreen will accept a download. A Chrome `Dangerous download blocked` result requires investigation or review by Google; do not treat changing the filename, archive or browser as a security fix.
 
 The manually triggered `Inspect Windows download` workflow can scan an exact historical Actions artifact by build run id without executing the installer. Trusted Windows signing still requires an owner's code-signing certificate or signing service.
+
+## Connection diagnostics
+
+Use **Показать журнал** in the app to view the native engine log and its full path. On macOS it is `~/Library/Logs/com.onekeymouse.desktop/native-engine.log`; on Windows it is under the app's local data directory (the UI shows the exact path). The log records pairing, monitor inventories, control transitions, the first pointer movement per handoff, and errors. It does not record keys, typed text, or session secrets. Logs rotate at 2 MiB, keeping one previous file. Both peers must use the diagnostic build to collect both sides; the wire protocol is unchanged.
+
+Windows pointer capture uses Raw Input for relative mouse movement while its native hook keeps the visible cursor at the handoff edge. Fast motion is checked for crossing the bottom boundary rather than landing on its last pixel rows. TCP event sockets disable Nagle buffering, and each encrypted frame is written with its prefix in one packet. Relative mice are supported by this capture path; absolute pointing devices need separate handling. Caps Lock auto-repeat is ignored on the receiver until the key is released.
