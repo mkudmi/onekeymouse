@@ -29,3 +29,11 @@ See [SPEC.md](SPEC.md) for behavior and remaining limitations.
 ## Verification
 
 Run `cargo test` and `cargo check` on the native platform. For a device test, connect and approve the Mac, verify Windows input remains local, cross the configured lower edge, test typing/clicking/scrolling and dragging on Mac, return upward, then test Ctrl+Alt+F12 while modifiers are held. Finally disconnect Wi-Fi while holding a remote key/button: input should return to Windows within a few seconds and remote held inputs should be released. Repeat across both Windows displays and outside the configured segment.
+
+## Windows download verification
+
+Windows builds scan the finished installer and its extracted payload with Microsoft Defender before uploading the installer artifact. The separate `onekeymouse-windows-security-report` artifact records the scan, definition version, Authenticode status and executable hashes. `SHA256SUMS.txt` accompanies the installer. An unavailable scanner or a detected threat fails the publishing step.
+
+The installer displays Microsoft's WebView2 setup if the runtime is missing; it does not install that dependency silently. Current builds are unsigned. A passing Defender scan does not guarantee that Chrome Safe Browsing or SmartScreen will accept a download. A Chrome `Dangerous download blocked` result requires investigation or review by Google; do not treat changing the filename, archive or browser as a security fix.
+
+The manually triggered `Inspect Windows download` workflow can scan an exact historical Actions artifact by build run id without executing the installer. Trusted Windows signing still requires an owner's code-signing certificate or signing service.

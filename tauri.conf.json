@@ -41,8 +41,9 @@
       },
       "webviewInstallMode": {
         "type": "downloadBootstrapper",
-        "silent": true
+        "silent": false
       }
-    }
+    },
+    "publisher": "mkudmi"
   }
 }

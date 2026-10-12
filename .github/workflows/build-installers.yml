@@ -35,7 +35,31 @@ jobs:
           node-version: 22
       - name: Build NSIS installer
         run: npm exec --yes --package @tauri-apps/cli@2.12.2 -- tauri build --bundles nsis
+      - name: Scan Windows installer and its payload
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force target/windows-inspection/installer | Out-Null
+          $installers = @(Get-ChildItem target/release/bundle/nsis -Filter '*-setup.exe')
+          if ($installers.Count -ne 1) { throw 'Expected exactly one Windows installer' }
+          Copy-Item $installers[0].FullName target/windows-inspection/installer/
+          7z x $installers[0].FullName '-otarget/windows-inspection/payload' -y
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot extract the installer for inspection' }
+          ./scripts/inspect-windows-download.ps1 -InputDirectory target/windows-inspection -ReportDirectory target/windows-security-report
+      - name: Create Windows checksums
+        shell: pwsh
+        run: |
+          $installer = Get-ChildItem target/release/bundle/nsis -Filter '*-setup.exe'
+          $hash = (Get-FileHash $installer.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  $($installer.Name)" | Set-Content target/release/bundle/nsis/SHA256SUMS.txt -Encoding ascii
       - uses: actions/upload-artifact@v4
         with:
           name: onekeymouse-windows-installer
-          path: target/release/bundle/nsis/*-setup.exe
+          path: |
+            target/release/bundle/nsis/*-setup.exe
+            target/release/bundle/nsis/SHA256SUMS.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: onekeymouse-windows-security-report
+          path: target/windows-security-report/
+          if-no-files-found: warn
