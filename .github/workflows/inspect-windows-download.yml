@@ -1,0 +1,50 @@
+name: Inspect Windows download
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_run_id:
+        description: Build installers run containing the blocked file
+        required: true
+        default: '38228719670'
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  inspect:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download the exact blocked artifact
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          BUILD_RUN_ID: ${{ inputs.build_run_id }}
+        run: |
+          if ($env:BUILD_RUN_ID -notmatch '^\d+$') { throw 'Invalid build run id' }
+          New-Item -ItemType Directory -Force reports | Out-Null
+          gh run view $env:BUILD_RUN_ID --json headSha,url,conclusion | Set-Content reports/build.json
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot identify the build' }
+          gh run download $env:BUILD_RUN_ID --name onekeymouse-windows-installer --dir inspection/installer
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot download the installer' }
+      - name: Extract installer payload without executing it
+        shell: pwsh
+        run: |
+          $installers = @(Get-ChildItem inspection/installer -Filter '*-setup.exe')
+          if ($installers.Count -ne 1) { throw 'Expected exactly one NSIS installer' }
+          7z x $installers[0].FullName '-oinspection/payload' -y
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot extract the installer for inspection' }
+      - name: Check signatures and scan installer and payload
+        shell: pwsh
+        run: ./scripts/inspect-windows-download.ps1 -InputDirectory inspection -ReportDirectory reports
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: windows-download-inspection
+          path: reports/
+          if-no-files-found: error
