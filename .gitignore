@@ -1,7 +1,5 @@
 /target
 /dist/
-/third_party/deskflow/
-
 /gen/
 /icons/android/
 /icons/ios/

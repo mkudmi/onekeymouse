@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "OneKeyMouse",
-  "version": "0.1.0",
-  "identifier": "com.onekeymouse.app",
+  "version": "0.2.0",
+  "identifier": "com.onekeymouse.desktop",
   "build": {
     "frontendDist": "web"
   },
@@ -20,10 +20,13 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
-    "targets": ["dmg", "nsis"],
+    "targets": [
+      "dmg",
+      "nsis"
+    ],
     "category": "Utility",
     "shortDescription": "Одна клавиатура и мышь для Mac и Windows",
-    "longDescription": "Объединяет Windows и Mac в одну рабочую область по локальной сети с помощью Deskflow.",
+    "longDescription": "Объединяет Windows и Mac через собственный сетевой движок OneKeyMouse.",
     "macOS": {
       "minimumSystemVersion": "13.0",
       "infoPlist": "Info.plist"
@@ -31,7 +34,10 @@
     "windows": {
       "nsis": {
         "installMode": "currentUser",
-        "languages": ["Russian", "English"]
+        "languages": [
+          "Russian",
+          "English"
+        ]
       },
       "webviewInstallMode": {
         "type": "downloadBootstrapper",

@@ -1,12 +1,12 @@
 # OneKeyMouse
 
-OneKeyMouse is a desktop setup app for sharing one keyboard and mouse between Windows and macOS over a local network. It discovers peers over mDNS, configures the screen edge and starts Deskflow with TLS and peer fingerprint checks enabled.
+OneKeyMouse is a desktop setup app for sharing one keyboard and mouse between Windows and macOS over a local network. It discovers peers over mDNS and uses a native Rust input engine with a dedicated encrypted peer protocol. No separate input-sharing app is installed.
 
 ## Installers
 
 The Tauri desktop shell produces a macOS `.dmg` and a Windows NSIS `.exe` installer. GitHub Actions builds these on native macOS and Windows runners. Run the `Build installers` workflow manually from the Actions tab, then download the `onekeymouse-macos-dmg` and `onekeymouse-windows-installer` artifacts from that run. Pushing a `v*` tag also builds both artifacts.
 
-The Windows installer cannot be built on this Mac; it is built by the Windows CI runner. The Mac `.dmg` can be built locally with:
+A local macOS build can be produced with:
 
 ```sh
 npm exec --yes --package @tauri-apps/cli@2.12.2 -- tauri build --bundles dmg
@@ -14,10 +14,18 @@ npm exec --yes --package @tauri-apps/cli@2.12.2 -- tauri build --bundles dmg
 
 The first packages are unsigned. macOS Gatekeeper and Windows SmartScreen may show publisher warnings until the app is signed with developer certificates. Signing and Apple notarization require the owner's certificates and credentials.
 
-## Deskflow dependency
+## Native input engine
 
-Install Deskflow on both computers first. On macOS, use the official Homebrew commands `brew tap deskflow/tap` and `brew install deskflow`. On Windows, download the Deskflow installer from the [official releases](https://github.com/deskflow/deskflow/releases). OneKeyMouse starts the separately installed Deskflow core and opens its GUI for system permissions and trusted-peer confirmation. On macOS, grant the requested Accessibility permission.
+OneKeyMouse has its own pairing protocol, encrypted event transport, and app lifecycle; it uses native OS input facilities through Rust libraries packaged inside the app. A Windows user must approve each new Mac pairing in the Windows app. macOS requires explicit user-granted Accessibility approval before remote input can be injected. No separate input-sharing app needs to be installed.
 
-The app opens as a native desktop window. On Windows, start the server. On the Mac, enter the Windows computer's local IP address (or choose the discovered computer) and start the client. Keep both computers on the same Wi-Fi network. The Windows config connects a lower edge segment to the Mac's upper edge. Adjust the segment start to match where the upper Windows monitor begins across the combined Windows desktop; the default 42.9% is based on the sample 900-pixel laptop plus 1200-pixel monitor widths.
+The app opens as a native desktop window. Start OneKeyMouse on Windows, then connect from the Mac using the Windows computer's private IP address. Both computers must be on the same local network. After pairing, input stays on Windows until the pointer reaches the configured segment of an exposed bottom monitor edge. It enters the top of the Mac's main display at the corresponding horizontal position. Move upward through the Mac's top edge to return to Windows, or press **Ctrl+Alt+F12** on the Windows keyboard. Stop and network loss also return local control and release remote keys/buttons.
+
+The Windows slider selects the start of the handoff segment as a percentage of the entire Windows desktop width. All active displays on Windows and Mac are detected automatically, including their coordinates, primary display and pixel dimensions. The interface shows each computer’s actual monitor arrangement. Connected peers exchange updated inventories every two seconds; internal Windows monitor seams do not transfer control. Release keys and mouse buttons before entering the Mac. Connecting/disconnecting a display or changing its bounds updates the layout automatically. A geometry change affecting remote control returns input to Windows safely. The Mac receiver currently targets its main display. Slider settings are kept for the current app run.
+
+Both computers must run this updated build (protocol version 2). Older builds cannot pair with it.
 
 See [SPEC.md](SPEC.md) for behavior and remaining limitations.
+
+## Verification
+
+Run `cargo test` and `cargo check` on the native platform. For a device test, connect and approve the Mac, verify Windows input remains local, cross the configured lower edge, test typing/clicking/scrolling and dragging on Mac, return upward, then test Ctrl+Alt+F12 while modifiers are held. Finally disconnect Wi-Fi while holding a remote key/button: input should return to Windows within a few seconds and remote held inputs should be released. Repeat across both Windows displays and outside the configured segment.
