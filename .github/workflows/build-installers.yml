@@ -15,10 +15,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: Install Tauri CLI
-        run: cargo install tauri-cli --version "^2" --locked
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
       - name: Build DMG
-        run: cargo tauri build --bundles dmg
+        run: npm exec --yes --package @tauri-apps/cli@2.12.2 -- tauri build --bundles dmg
       - uses: actions/upload-artifact@v4
         with:
           name: onekeymouse-macos-dmg
@@ -29,10 +30,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: Install Tauri CLI
-        run: cargo install tauri-cli --version "^2" --locked
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
       - name: Build NSIS installer
-        run: cargo tauri build --bundles nsis
+        run: npm exec --yes --package @tauri-apps/cli@2.12.2 -- tauri build --bundles nsis
       - uses: actions/upload-artifact@v4
         with:
           name: onekeymouse-windows-installer

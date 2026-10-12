@@ -9,8 +9,7 @@ The Tauri desktop shell produces a macOS `.dmg` and a Windows NSIS `.exe` instal
 The Windows installer cannot be built on this Mac; it is built by the Windows CI runner. The Mac `.dmg` can be built locally with:
 
 ```sh
-cargo install tauri-cli --version "^2" --locked
-cargo tauri build --bundles dmg
+npm exec --yes --package @tauri-apps/cli@2.12.2 -- tauri build --bundles dmg
 ```
 
 The first packages are unsigned. macOS Gatekeeper and Windows SmartScreen may show publisher warnings until the app is signed with developer certificates. Signing and Apple notarization require the owner's certificates and credentials.
