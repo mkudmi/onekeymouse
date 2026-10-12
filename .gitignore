@@ -2,3 +2,7 @@
 /third_party/deskflow/
 
 /gen/
+/icons/android/
+/icons/ios/
+/icons/Square*.png
+/icons/StoreLogo.png
