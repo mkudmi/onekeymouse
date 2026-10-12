@@ -56,6 +56,80 @@ fn release(state: &mut InputState, injector: &mut inputs::inject::Injector) {
     }
 }
 
+/// Preserve every delta in geometry, but only post the latest position to the
+/// OS. Flush before buttons/keys/wheel so drag and click ordering is unchanged.
+#[derive(Default)]
+struct PointerOutput {
+    pending: Option<(f64, f64)>,
+}
+impl PointerOutput {
+    fn update(&mut self, x: f64, y: f64) {
+        self.pending = Some((x, y));
+    }
+    fn flush(
+        &mut self,
+        mut post: impl FnMut(f64, f64) -> Result<(), String>,
+    ) -> Result<bool, String> {
+        if let Some((x, y)) = self.pending {
+            post(x, y)?;
+            self.pending = None;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+}
+
+#[derive(Default)]
+struct MotionMetrics {
+    received: u64,
+    posted: u64,
+    peak_queue: usize,
+    previous: Option<std::time::Instant>,
+    max_gap_ms: f64,
+    max_post_ms: f64,
+}
+impl MotionMetrics {
+    fn receive(&mut self, queued: usize) {
+        let now = std::time::Instant::now();
+        if let Some(previous) = self.previous {
+            self.max_gap_ms = self
+                .max_gap_ms
+                .max(now.duration_since(previous).as_secs_f64() * 1000.);
+        }
+        self.previous = Some(now);
+        self.received += 1;
+        self.peak_queue = self.peak_queue.max(queued);
+    }
+    fn report(&mut self) {
+        if self.received > 0 {
+            crate::diagnostics::record(
+                "motion_metrics",
+                &serde_json::json!({
+                    "received":self.received,"posted":self.posted,"peak_queue":self.peak_queue,
+                    "max_gap_ms":self.max_gap_ms,"max_post_ms":self.max_post_ms
+                })
+                .to_string(),
+            );
+        }
+        *self = Self::default();
+    }
+}
+fn flush_pointer(
+    output: &mut PointerOutput,
+    state: &InputState,
+    metrics: &mut MotionMetrics,
+) -> Result<(), String> {
+    let started = std::time::Instant::now();
+    if output.flush(|x, y| desktop::move_pointer(x, y, state.drag_button()))? {
+        metrics.posted += 1;
+        metrics.max_post_ms = metrics
+            .max_post_ms
+            .max(started.elapsed().as_secs_f64() * 1000.);
+    }
+    Ok(())
+}
+
 pub async fn receiver(
     stream: TcpStream,
     shared: [u8; 32],
@@ -75,6 +149,11 @@ pub async fn receiver(
     let mut cipher = SessionCipher::new(shared, true)?;
     let mut state = InputState::default();
     let mut pointer: Option<RemotePointer> = None;
+    let mut output = PointerOutput::default();
+    let mut metrics = MotionMetrics::default();
+    let mut pointer_tick = tokio::time::interval(Duration::from_millis(4));
+    pointer_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut metrics_tick = tokio::time::interval(Duration::from_secs(5));
     let mut sequence = 0;
     let mut logged_first_motion = false;
     let mut last = 0;
@@ -85,6 +164,8 @@ pub async fn receiver(
     let result=async{
         loop {
             tokio::select!{
+                _=pointer_tick.tick()=>{flush_pointer(&mut output,&state,&mut metrics)?;},
+                _=metrics_tick.tick()=>{metrics.report();},
                 _=&mut stop=>{let _=send(&mut write,&mut cipher,Frame::Disconnect{reason:"stopped by user".into()}).await;break;},
                 _=heartbeat.tick()=>{desktop::check_receive_permission(false)?; sequence+=1;send(&mut write,&mut cipher,Frame::KeepAlive{sequence}).await?;},
                 _=screen_refresh.tick()=>{
@@ -93,6 +174,8 @@ pub async fn receiver(
                         let next_bounds=displays.iter().find(|s|s.primary).ok_or("Нет основного экрана Mac")?.bounds;
                         if next_bounds!=bounds {
                             if let Some(p)=pointer.take() {
+                                flush_pointer(&mut output,&state,&mut metrics)?;
+                                metrics.previous=None;
                                 release(&mut state,&mut injector);
                                 let position=((p.x-p.bounds.x)/(p.bounds.width-1.0).max(1.0)).clamp(0.0,1.0);
                                 send(&mut write,&mut cipher,Frame::ReturnControl{position}).await?;
@@ -110,6 +193,8 @@ pub async fn receiver(
                             last=sequence;
                             match event {
                                 InputEvent::Enter{position} if valid_position(position)=>{
+                                    flush_pointer(&mut output,&state,&mut metrics)?;
+                                    metrics.previous=None;
                                     release(&mut state,&mut injector);
                                     let p=RemotePointer::enter(bounds,position);
                                     logged_first_motion = false;
@@ -118,22 +203,28 @@ pub async fn receiver(
                                     crate::engine_state(&backend, "Управление на Mac · вверх для возврата").await;
                                 },
                                 InputEvent::ReleaseAll=>{
+                                    flush_pointer(&mut output,&state,&mut metrics)?;
+                                    metrics.previous=None;
                                     release(&mut state,&mut injector); pointer=None;
                                     crate::engine_state(&backend, "Подключено · курсор на Windows").await;
                                 },
                                 InputEvent::Pointer{dx,dy} if dx.is_finite() && dy.is_finite() && dx.abs()<=100000. && dy.abs()<=100000.=>{
                                     if let Some(p)=pointer.as_mut(){
+                                        metrics.receive(incoming.len());
                                         if !logged_first_motion { crate::diagnostics::record("first_pointer", "Received Windows pointer movement"); logged_first_motion = true; }
                                         if let Some(position)=p.motion(dx,dy){
+                                            flush_pointer(&mut output,&state,&mut metrics)?;
+                                            metrics.previous=None;
                                             crate::diagnostics::record("return_control", "Mac top edge crossed");
                                             release(&mut state,&mut injector); pointer=None;
                                             send(&mut write,&mut cipher,Frame::ReturnControl{position}).await?;
                                             crate::engine_state(&backend, "Подключено · курсор на Windows").await;
-                                        } else {desktop::move_pointer(p.x,p.y,state.drag_button())?;}
+                                        } else {output.update(p.x,p.y);}
                                     }
                                 },
                                 event @ (InputEvent::Key{..}|InputEvent::Button{..}|InputEvent::Wheel{..})=>{
                                     if let Some(p)=pointer.as_ref(){
+                                        flush_pointer(&mut output,&state,&mut metrics)?;
                                         if let InputEvent::Wheel{horizontal,vertical}=&event
                                             && (!horizontal.is_finite() || !vertical.is_finite()) {
                                             return Err("Некорректная прокрутка".into());
@@ -164,6 +255,7 @@ pub async fn receiver(
         Ok(())
     }.await;
     reader.abort();
+    metrics.report();
     release(&mut state, &mut injector);
     backend.state.write().await.peer_layout.clear();
     result
@@ -264,6 +356,68 @@ mod tests {
         );
         (client.unwrap(), server.unwrap().0)
     }
+    #[test]
+    fn pointer_bursts_keep_geometry_and_flush_before_drag_changes() {
+        let bounds = crate::handoff::Rect {
+            x: 0.,
+            y: 0.,
+            width: 100.,
+            height: 100.,
+        };
+        let mut pointer = RemotePointer::enter(bounds, 0.5);
+        let mut output = PointerOutput::default();
+        let mut posted = Vec::new();
+        // Clamp each individual delta: summing first would yield a different
+        // endpoint after hitting the right boundary and reversing direction.
+        assert!(pointer.motion(200., 10.).is_none());
+        output.update(pointer.x, pointer.y);
+        assert!(pointer.motion(-20., 10.).is_none());
+        output.update(pointer.x, pointer.y);
+        assert_eq!(pointer.x, 79.);
+        output
+            .flush(|x, y| {
+                posted.push((x, y, false));
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(posted, vec![(79., 23., false)]);
+        assert!(
+            !output
+                .flush(|_, _| panic!("Idle timer must not post"))
+                .unwrap()
+        );
+        // A button transition flushes the pending motion using the old drag
+        // state; the subsequent motion belongs to the new button state.
+        pointer.motion(-10., 10.);
+        output.update(pointer.x, pointer.y);
+        output
+            .flush(|x, y| {
+                posted.push((x, y, false));
+                Ok(())
+            })
+            .unwrap();
+        pointer.motion(-10., 10.);
+        output.update(pointer.x, pointer.y);
+        output
+            .flush(|x, y| {
+                posted.push((x, y, true));
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            posted,
+            vec![(79., 23., false), (69., 33., false), (59., 43., true)]
+        );
+    }
+
+    #[test]
+    fn failed_pointer_post_keeps_pending_position() {
+        let mut output = PointerOutput::default();
+        output.update(10., 20.);
+        assert!(output.flush(|_, _| Err("OS error".into())).is_err());
+        assert_eq!(output.pending, Some((10., 20.)));
+    }
+
     #[tokio::test]
     async fn reader_preserves_fragmented_frames_while_other_events_win_select() {
         let (mut sender, receiver) = pair().await;

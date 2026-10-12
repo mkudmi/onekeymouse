@@ -170,8 +170,19 @@ fn post_pointer(
         event_source::{CGEventSource, CGEventSourceStateID},
         geometry::CGPoint,
     };
-    let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
-        .map_err(|_| "Нет доступа к вводу macOS")?;
+    // Reuse one source per backend thread rather than allocating one for every
+    // hardware sample. Events still carry the shared HID state and our tag.
+    thread_local! { static MOUSE_SOURCE: std::cell::RefCell<Option<CGEventSource>> = const {std::cell::RefCell::new(None)}; }
+    let source = MOUSE_SOURCE.with(|cached| {
+        let mut cached = cached.borrow_mut();
+        if cached.is_none() {
+            *cached = Some(
+                CGEventSource::new(CGEventSourceStateID::HIDSystemState)
+                    .map_err(|_| "Нет доступа к вводу macOS")?,
+            );
+        }
+        Ok::<_, String>(cached.as_ref().unwrap().clone())
+    })?;
     let event = CGEvent::new_mouse_event(source, kind, CGPoint::new(x, y), button)
         .map_err(|_| "Не удалось передать мышь Mac")?;
     event.set_integer_value_field(
